@@ -1,0 +1,15 @@
+[project]
+name = "wallet-hunter"
+version = "1.0.0"
+description = "On-chain early-buyer & smart-money consensus scanner (7-step method)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = []
+
+[project.scripts]
+wallet-hunter = "wallet_hunter:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
