@@ -52,6 +52,15 @@ CONSENSUS_DAYS = 7
 MIN_MCAP = 200_000
 MIN_HOLDERS = 500
 
+# 稳定币/包装币天然出现在所有钱包里，不算共识
+STABLE_TOKENS = {
+    "0xdac17f958d2ee523a2206206994597c13d831ec7",  # USDT
+    "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",  # USDC
+    "0x6b175474e89094c44da98b954eedeac495271d0f",  # DAI
+    "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",  # WETH
+    "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599",  # WBTC
+}
+
 
 def _rol(v, n):
     n %= 64
@@ -279,7 +288,7 @@ class Evm:
     def wallet_profile(self, addr):
         tr = (self.v2(f"addresses/{addr}/token-transfers", type="ERC-20") or {}).get("items") or []
         txs = []
-        stamps, recv = [], defaultdict(lambda: {"symbol": "", "count": 0, "last": None})
+        stamps, recv = [], defaultdict(lambda: {"symbol": "", "count": 0, "last": None, "senders": {}})
         for it in tr:
             t = _parse_ts(it.get("timestamp"))
             if not t:
@@ -288,8 +297,11 @@ class Evm:
             if ((it.get("to") or {}).get("hash") or "").lower() == addr.lower():
                 tok = it.get("token") or {}
                 tk = (tok.get("address_hash") or tok.get("address") or "?").lower()
+                frm = ((it.get("from") or {}).get("hash") or "").lower()
                 recv[tk]["symbol"] = tok.get("symbol") or "?"
                 recv[tk]["count"] += 1
+                if frm:
+                    recv[tk]["senders"][frm] = recv[tk]["senders"].get(frm, 0) + 1
                 recv[tk]["last"] = max(recv[tk]["last"], t) if recv[tk]["last"] else t
         newest = max(stamps) if stamps else None
         if newest is None or (NOW - newest).days > ACTIVE_DAYS:      # 只在疑似休眠时补查原生交易
@@ -511,14 +523,15 @@ def cmd_scan(args):
     alive = [r for r in rows if r["active30"] and not r["bot"]]
     print(f"⑤ 幸存 {len(alive)} 个（活跃 + 非机器人）")
 
-    cache, cons = {}, defaultdict(lambda: {"wallets": set(), "last": None, "symbol": ""})
+    cache, cons = {}, defaultdict(lambda: {"wallets": set(), "last": None, "symbol": "",
+                                           "senders": defaultdict(set)})
     for r in alive:
         for tk, d in r["received"].items():
             if tk not in cache:
                 cache[tk] = evm.token_meta(tk)
                 cache[tk]["ok"] = (cache[tk]["mcap"] >= MIN_MCAP
                                    or cache[tk]["holders"] >= MIN_HOLDERS)
-            if not cache[tk]["ok"]:
+            if not cache[tk]["ok"] or tk in STABLE_TOKENS:
                 continue
             if act is None:
                 if not d["last"] or (NOW - d["last"]).days > CONSENSUS_DAYS:
@@ -526,19 +539,30 @@ def cmd_scan(args):
             cons[tk]["wallets"].add(r["address"])
             cons[tk]["symbol"] = cache[tk]["symbol"] or d["symbol"]
             cons[tk]["last"] = d["last"]
+            for sender in (d.get("senders") or {}):
+                cons[tk]["senders"][sender].add(r["address"])
 
-    print(f"⑥ 共识（近 {CONSENSUS_DAYS} 天）")
+    print(f"⑥ 共识（近 {CONSENSUS_DAYS} 天，已滤垃圾币；空投/单源分发会被标出来）")
+    kept = []
     for tk, d in sorted(cons.items(), key=lambda kv: -len(kv[1]["wallets"])):
         n = len(d["wallets"])
-        if n >= 2:
-            print(f"   {d['symbol']:10s} {tk} {n} 个钱包 {'★' if n >= 3 else ''}")
-    if not cons:
-        print("   无：没有 ≥2 个幸存钱包在同期买同一个币")
+        if n < 2:
+            continue
+        top, ws = (None, set())
+        if d["senders"]:
+            top, ws = max(d["senders"].items(), key=lambda kv: len(kv[1]))
+        airdrop = len(ws) >= 3 and len(ws) / n >= 0.6
+        tag = f"空投/单源分发 → 剔除（同一发送方 {top[:10]}… 给了 {len(ws)} 个钱包）" if airdrop else "真买入"
+        mark = "★" if (n >= 3 and not airdrop) else ""
+        print(f"   {d['symbol']:10s} {tk} {n} 个钱包 {mark} {tag}")
+        if not airdrop:
+            kept.append({"symbol": d["symbol"], "token": tk, "wallets": sorted(d["wallets"])})
+    if not kept:
+        print("   无：没有 ≥2 个钱包在同期真买入同一个币")
 
     result = {"version": VERSION, "chain": chain, "token": ca, "meta": meta,
               "source": src, "first_block": start, "wallets": rows,
-              "consensus": [{"symbol": d["symbol"], "token": tk,
-                             "wallets": sorted(d["wallets"])} for tk, d in cons.items()]}
+              "consensus": kept}
     out_dir = args.out or os.environ.get("WH_OUT") or "out"
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, f"scan-{meta['symbol'] or ca[:8]}-{datetime.now():%Y%m%d-%H%M}.json")
